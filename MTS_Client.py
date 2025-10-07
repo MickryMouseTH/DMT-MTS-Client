@@ -1,7 +1,7 @@
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from LogLibrary import Loguru_Logging, Load_Config
 from requests.auth import HTTPBasicAuth
 from datetime import datetime,timedelta
-from loguru import logger
 import multiprocessing
 import pymysql.cursors
 import platform
@@ -19,8 +19,14 @@ import os
 
 # ----------------------- Configuration Values -----------------------
 Program_Name = "MTS_Python"        # Program name for identification and logging.
-Program_Version = "3.2"            # Program version used for file naming and logging.
+Program_Version = "3.3"            # Program version used for file naming and logging.
 # ---------------------------------------------------------------------
+
+# Determine the directory of the script or executable.
+if getattr(sys, 'frozen', False):
+    script_dir = os.path.dirname(sys.executable)
+else:
+    script_dir = os.path.dirname(os.path.abspath(__file__))
 
 default_config = {
     "url": "",                # API endpoint URL.
@@ -53,100 +59,42 @@ default_config = {
     "Check_ALPR_Enable": 0,   # Set to 1 to enable ALPR check.
     "Check_ALPR_API_Enable": 0,      # Set to 1 to enable ALPR API check.
     "Check_NTP_Enable": 0,   # Set to 1 to enable NTP check.
-    "Log_Console_Enable": 1,  # Set to "true" to enable console logging.
+    "Log_Console": 1,  # Set to "true" to enable console logging.
     "RamOffset": 0,           # Optional RAM offset to subtract from reported usage.
     "TimeSleep": 30,          # Interval (in seconds) between scheduled tasks.
     "log_Level": "DEBUG",
-    "log_Backup": 90,         # Log retention duration (number of backup files).
-    "Log_Size": "10 MB"       # Maximum log file size before rotation.
+    "log_Backup": 90,         # Log retention **days**.
+    "Log_Size": "10 MB",      # Maximum log file size before rotation.
+    "http_timeout_sec": 10,
+    "http_retries": 2
 }
 
+config = Load_Config(default_config, Program_Name, script_dir)
+logger = Loguru_Logging(config, Program_Name, Program_Version, script_dir)
+
 EXTRA_PROCESS_STATUS = []
-
-def Load_Config(default_config,Program_Name):
-    # Define the configuration file path.
-    config_file_path = f'{Program_Name}.config.json'
-
-    # Create config file with default values if it does not exist.
-    if not os.path.exists(config_file_path):
-        default_config = default_config 
-        with open(config_file_path, 'w') as new_config_file:
-            json.dump(default_config, new_config_file, indent=4)
-
-    # Load configuration
-    with open(config_file_path, 'r') as config_file:
-        config = json.load(config_file)
-    
-    return config
-
-# ----------------------- Loguru Logging Setup -----------------------
-def Loguru_Logging(config,Program_Name,Program_Version):
-    logger.remove()
-
-    log_Backup = int(config.get('log_Backup', 90))  # Default to 90 days if not set
-    if log_Backup < 1:  # Ensure log retention is at least 1 day
-        log_Backup = 1
-    Log_Size = config.get('Log_Size', '10 MB')  # Default to 10 MB if not set
-    log_Level = config.get('log_Level', 'DEBUG').upper()  # Default to DEBUG if not set
-
-    log_dir = "logs"
-    os.makedirs(log_dir, exist_ok=True)
-
-    log_file_name = f'{Program_Name}_{Program_Version}.log'
-    log_file = os.path.join(log_dir, log_file_name)
-
-    if config.get('Log_Console_Enable',0) == 1:
-        logger.add(
-            sys.stdout, 
-            level=log_Level, 
-            format="<green>{time}</green> | <blue>{level}</blue> | <cyan>{thread.id}</cyan> | <magenta>{function}</magenta> | {message}"
-        )
-
-    logger.add(
-        log_file,
-        format="{time} | {level} | {thread.id} | {function} | {message}",
-        level=log_Level,
-        rotation=Log_Size,
-        retention=log_Backup,
-        compression="zip"
-    )
-
-    logger.info('-' * 117)
-    logger.info(f"Start {Program_Name} Version {Program_Version}")
-    logger.info('-' * 117)
-
-    return logger
 
 def get_disk_info():
     """
     Retrieve disk usage information for each disk partition.
-
-    Returns:
-        A list of dictionaries, each containing:
-            - disk: Full device name (e.g., /dev/sda1).
-            - spaceGb: Total disk space in gigabytes.
-            - usageGb: Used disk space in gigabytes.
-            - freeGb: Free disk space in gigabytes.
-            - percentUsed: Percentage of disk space used.
     """
     disks_info = []
     for part in psutil.disk_partitions():
         try:
             usage = psutil.disk_usage(part.mountpoint)
-            total_gb = round(usage.total / (1024**3), 2)
-            used_gb = round(usage.used / (1024**3), 2)
-            free_gb = round(usage.free / (1024**3), 2)
+            total_gb = usage.total / (1024**3)
+            used_gb = usage.used / (1024**3)
+            free_gb = usage.free / (1024**3)
             percent_used = usage.percent
-            logger.debug(f"Disk {part.device}: mountpoint={part.mountpoint}, total={total_gb}GB, used={used_gb}GB, free={free_gb}GB, percentUsed={percent_used}")
+            logger.debug(f"Disk {part.device}: mountpoint={part.mountpoint}, total={total_gb:.2f}GB, used={used_gb:.2f}GB, free={free_gb:.2f}GB, percentUsed={percent_used}")
             disks_info.append({
                 "disk": part.device,
-                "spaceGb": int(total_gb),
-                "usageGb": int(used_gb),
-                "freeGb": int(free_gb),
+                "spaceGb": round(total_gb, 2),
+                "usageGb": round(used_gb, 2),
+                "freeGb":  round(free_gb, 2),
                 "percentUsed": int(percent_used)
             })
         except PermissionError as e:
-            # Log error if permission is denied for a partition.
             logger.error(f'PermissionError accessing {part.mountpoint}: {e}')
             continue
     logger.info(f'Disk Info: {disks_info}')
@@ -168,7 +116,9 @@ def process_directory(directory):
                         file_size = entry.stat().st_size
                         local_size += file_size
                         local_count += 1
-                        logger.debug(f"File: {entry.path} size: {file_size} bytes")
+                        # ลด spam log: คอมเมนต์ไว้ถ้าต้องการ
+                        # if local_count % 1000 == 0:
+                        #     logger.debug(f"[{directory}] processed {local_count} files")
                     except Exception as e:
                         logger.error(f"Error getting size for file {entry.path}: {e}")
                 elif entry.is_dir(follow_symlinks=False):
@@ -181,19 +131,15 @@ def process_directory(directory):
 def process_subfolder(subfolder_path):
     """
     Concurrently process a subfolder using breadth-first search.
-    ใช้ ThreadPoolExecutor สแกนทุกโฟลเดอร์ในระดับเดียวกันพร้อมกัน
-    แล้วรวมผลลัพธ์ (ขนาดไฟล์และจำนวนไฟล์) จากทุกระดับของ subdirectories
     """
     total_size = 0
     total_count = 0
-    # เริ่มต้นจาก subfolder_path เป็นรายการแรกในการสแกน
     directories = [subfolder_path]
     
-    with ThreadPoolExecutor(max_workers=CPU_COUNT) as executor:
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS_IO) as executor:
         while directories:
-            # ส่งงานสแกนสำหรับทุก directory ในระดับปัจจุบัน
             futures = {executor.submit(process_directory, d): d for d in directories}
-            directories = []  # เตรียมรับรายการของ subdirectories จากรอบถัดไป
+            directories = []
             for future in as_completed(futures):
                 try:
                     size, count, subdirs = future.result()
@@ -208,31 +154,28 @@ def process_subfolder(subfolder_path):
 def get_folder_info(folder_path):
     """
     Retrieve file count and total file size (in kilobytes) for a given folder.
-    Processes files in the folder and its subdirectories concurrently.
     """
     logger.debug(f"Start processing folder: {folder_path}")
     total_size = 0
     file_count = 0
+    total_size_kb = 0.0
 
     subfolders = []
     try:
-        # สแกนไฟล์ในระดับแรกของ folder_path
         with os.scandir(folder_path) as it:
             for entry in it:
-                if entry.is_file():
+                if entry.is_file(follow_symlinks=False):
                     file_count += 1
                     try:
                         file_size = entry.stat().st_size
                         total_size += file_size
-                        logger.debug(f"File: {entry.path} size: {file_size} bytes")
                     except Exception as e:
                         logger.error(f"Error getting size for file {entry.path}: {e}")
-                elif entry.is_dir():
+                elif entry.is_dir(follow_symlinks=False):
                     subfolders.append(entry.path)
                     logger.debug(f"Found directory: {entry.path}")
 
-        # ประมวลผล subfolders แบบคู่ขนาน
-        with ThreadPoolExecutor(max_workers=CPU_COUNT) as executor:
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS_IO) as executor:
             future_to_subfolder = {executor.submit(process_subfolder, subfolder): subfolder for subfolder in subfolders}
             for future in as_completed(future_to_subfolder):
                 try:
@@ -249,35 +192,33 @@ def get_folder_info(folder_path):
     except Exception as e:
         logger.error(f"Error processing folder {folder_path}: {e}")
     logger.debug(f"Finished processing folder: {folder_path}")
-    return {
+    folder_info = {
         "pathFolder": folder_path,
         "fileCount": file_count,
-        "fileSiteKilobyte": total_size_kb
+        "fileSiteKilobyte": total_size_kb  # คีย์เดิม
     }
+    folder_info["fileSizeKilobyte"] = total_size_kb  # alias ใหม่ เผื่อระบบใหม่
+    return folder_info
 
 def check_process_running(process_name):
-    """
-    Check whether a process with the specified name is currently running.
-    
-    Args:
-        process_name (str): The name of the process to search for.
-    
-    Returns:
-        bool: True if the process is running, False otherwise.
-    """
-    result = any(proc.info['name'] == process_name for proc in psutil.process_iter(['name']))
-    logger.debug(f"Check process running for '{process_name}': {result}")
-    return result
+    target = (process_name or "").lower()
+    for proc in psutil.process_iter(['name', 'exe']):
+        try:
+            name = (proc.info.get('name') or "").lower()
+            exe  = (proc.info.get('exe') or "").lower()
+            if target and (target == name or target in os.path.basename(exe)):
+                return True
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+    return False
 
 def get_folders_info(folder_paths):
     """
     Process a list of folders concurrently to collect file count and size for each folder.
     """
     logger.info(f"Processing folders: {folder_paths}")
-    max_workers = min(len(folder_paths), CPU_COUNT)
-    logger.info(f"Using max_workers: {max_workers}")
     results = []
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS_IO) as executor:
         future_to_folder = {executor.submit(get_folder_info, folder): folder for folder in folder_paths}
         for future in as_completed(future_to_folder):
             folder_path = future_to_folder[future]
@@ -295,14 +236,12 @@ def prepare_request_body(config_data, extra_processes=None):
     Assemble the JSON payload with system metrics and folder information for the API.
     """
     try:
-        # Compute system uptime in minutes.
         boot_time = psutil.boot_time()
         current_time = datetime.now()
         uptime_seconds = (current_time - datetime.fromtimestamp(boot_time)).total_seconds()
         uptime_minutes = round(uptime_seconds / 60)
         logger.debug(f"Boot time: {boot_time}, Current time: {current_time}, Uptime seconds: {uptime_seconds}, Uptime minutes: {uptime_minutes}")
 
-        # Gather process status information from the configuration.
         processes = [
             {
                 "processName": proc["processName"],
@@ -316,31 +255,26 @@ def prepare_request_body(config_data, extra_processes=None):
         app_running = all(proc["running"] for proc in processes)
         logger.debug(f"Overall app_running status: {app_running}")
 
-        # Measure CPU and memory usage.
         cpu_usage = psutil.cpu_percent(interval=1)
         ram_usage = psutil.virtual_memory().percent
         logger.debug(f"CPU usage: {cpu_usage}%, RAM usage: {ram_usage}%")
 
-        # Gather disks information.
         disks = get_disk_info()
         logger.debug(f"Disks info collected: {disks}")
 
-        # Gather folders information.
         folders_info = get_folders_info(config_data.get("folders", []))
         logger.debug(f"Folders info collected: {folders_info}")
 
-        # Operating system information.
         operating_system = platform.system() + " " + platform.release()
         logger.debug(f"Operating system: {operating_system}")
 
-        # Build the request payload with all gathered system metrics.
         request_body = {
             "requestId": "MTS" + datetime.now().strftime("%Y%m%d%H%M%S%f"),
             "requestDatetime": datetime.now().isoformat(),
             "deviceName": config_data.get("deviceName", "Unknown Device"),
             "appRunning": app_running,
             "percentCpuUsage": cpu_usage,
-            "percentRamUsage": ram_usage - config.get("RamOffset", 0),  # Subtract any overhead if specified.
+            "percentRamUsage": max(0, min(100, ram_usage - config_data.get("RamOffset", 0))),
             "uptimeMinute": uptime_minutes,
             "disks": disks,
             "folders": folders_info,
@@ -349,7 +283,6 @@ def prepare_request_body(config_data, extra_processes=None):
         }
         logger.debug(f"Initial request_body: {request_body}")
 
-        # Add an identifier if provided; otherwise, include log folder size.
         if config_data.get("tsbId", ""):
             request_body["tsbId"] = config_data["tsbId"]
             logger.debug(f"tsbId provided: {config_data['tsbId']}")
@@ -364,32 +297,32 @@ def prepare_request_body(config_data, extra_processes=None):
         request_body = {}
     return request_body
 
-def send_api_request(url, request_body, auth_user, auth_pass):
-    """
-    Send a POST request to the specified API endpoint using basic authentication.
-    """
+def send_api_request(url, request_body, auth_user, auth_pass, timeout_sec=10, retries=2):
     headers = {"Content-Type": "application/json"}
-    logger.debug(f"Sending API request to {url} with payload: {request_body} and auth_user: {auth_user}")
-    try:
-        response = requests.post(url, headers=headers, json=request_body,
-                                 auth=HTTPBasicAuth(auth_user, auth_pass))
-        status_code = response.status_code
-        logger.debug(f"Received response with status code: {status_code}")
+    last_err = None
+    for attempt in range(retries + 1):
         try:
-            response_json = response.json()
-            logger.debug(f"Response JSON: {response_json}")
-        except ValueError:
-            response_json = {"error": "Invalid JSON response"}
-            logger.error("Invalid JSON response received from API")
-        return status_code, response_json
-    except requests.RequestException as e:
-        logger.error(f"HTTP request failed: {e}")
-        return None, {"error": str(e)}
+            resp = requests.post(
+                url, headers=headers, json=request_body,
+                auth=HTTPBasicAuth(auth_user, auth_pass),
+                timeout=timeout_sec
+            )
+            status_code = resp.status_code
+            try:
+                response_json = resp.json()
+            except ValueError:
+                response_json = {"error": "Invalid JSON response"}
+            return status_code, response_json
+        except requests.RequestException as e:
+            last_err = e
+            logger.warning(f"HTTP request failed (attempt {attempt+1}/{retries+1}): {e}")
+            time.sleep(1)
+    return None, {"error": str(last_err)}
 
 def check_alpr(config):
     """
     ตรวจสอบสถานะของ ALPR และอัปเดตสถานะในตัวแปร global
-    (แก้ไขให้ใช้ PyMySQL)
+    (ใช้ PyMySQL)
     """
     logger.info('Start Check ALPR with PyMySQL')
     global EXTRA_PROCESS_STATUS
@@ -402,17 +335,15 @@ def check_alpr(config):
 
     try:
         logger.info("Starting connection to MySQL using PyMySQL")
-        # --- แก้ไข: ใช้ pymysql.connect() ---
         db_conn = pymysql.connect(
             host=config["host"],
             user=config["user"],
             password=config["password"],
-            database=config["databaseName"], # ตรวจสอบให้แน่ใจว่า key นี้มีใน config.json
-            cursorclass=pymysql.cursors.DictCursor  # <-- ทำให้ผลลัพธ์เป็น Dictionary
+            database=config["databaseName"],
+            cursorclass=pymysql.cursors.DictCursor
         )
         logger.info("Connected to MySQL successfully with PyMySQL")
         
-        # ใช้ with ... as ... เพื่อให้ cursor ปิดตัวเองอัตโนมัติ
         with db_conn.cursor() as cursor:
             query = """
                 SELECT p.Status_IN_OUT as LaneName,
@@ -421,7 +352,6 @@ def check_alpr(config):
                 WHERE p.LogDate >= DATE_SUB(NOW(), INTERVAL 30 DAY)
                 GROUP BY p.Status_IN_OUT
             """
-            
             cursor.execute(query)
             db_results = cursor.fetchall()
             logger.debug(f'SQL Data fetched: {len(db_results)} rows')
@@ -432,7 +362,7 @@ def check_alpr(config):
 
         for lane_config in lanes_to_check:
             lane_name = lane_config["LaneName"]
-            lane_Show = "ALPR " + lane_name # ใช้ lane_Show ในการแสดงผล Log
+            lane_Show = "ALPR " + lane_name
             check_houes = lane_config["CheckHours"]
             running_status = False
 
@@ -450,15 +380,13 @@ def check_alpr(config):
             
             EXTRA_PROCESS_STATUS.append({"processName": lane_Show, "running": running_status})
 
-    except pymysql.Error as e: # <-- แก้ไข: ดักจับ Error ของ PyMySQL
+    except pymysql.Error as e:
         logger.error(f'An error occurred in check_alpr: {e}')
-        # หากเกิดข้อผิดพลาด ให้กำหนดสถานะทุกเลนเป็น False
         lanes_to_check = config.get("dataCheck", [])
         for lane_config in lanes_to_check:
              lane_Show = "ALPR " + lane_config["LaneName"]
              EXTRA_PROCESS_STATUS.append({"processName": lane_Show, "running": False})
     finally:
-        # ปิดการเชื่อมต่อเสมอไม่ว่าจะสำเร็จหรือล้มเหลว
         if db_conn:
             db_conn.close()
             logger.info("MySQL connection closed.")
@@ -468,7 +396,7 @@ def check_alpr(config):
 def Check_alpr_API():
     global EXTRA_PROCESS_STATUS
     logger.info('Start Check ALPR API')
-    with ThreadPoolExecutor(max_workers=1) as executor:
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS_IO) as executor:
         future = executor.submit(send_http_request, config.get('image_path', ""), config.get('image_url', ""))
         try:
             response_text = future.result()
@@ -495,13 +423,11 @@ def Check_alpr_API():
 def send_http_request(image_path, url):
     """Create and send an HTTP request."""
     try:
-        # Convert image to Base64
         image_base64 = image_to_base64(image_path)
         if not image_base64:
             logger.error("Failed to convert image to Base64.")
             return None
 
-        # Create JSON payload
         payload = {
             "data_type": "alpr_recognition",
             "hw_id": "a1027724-70dd-4b92-85ad-cdb0984ddd62",
@@ -520,17 +446,16 @@ def send_http_request(image_path, url):
         logger.debug(f"Sending HTTP request to {url} with payload: {payload}")
 
         response = requests.post(url, headers=headers, json=payload, timeout=10)
-        response.raise_for_status()  # Raise an HTTPError for bad responses (4xx and 5xx)
+        response.raise_for_status()
         return response.text
     except requests.RequestException as e:
         logger.error(f"HTTP request failed: {e}")
         return None
 
 def image_to_base64(image_path):
-
+    encoded_string = None
     try:
         logger.debug(f'Convert images Path : {image_path}')
-        """แปลงรูปภาพเป็น Base64"""
         with open(image_path, "rb") as image_file:
             encoded_string = base64.b64encode(image_file.read()).decode('utf-8')
     except Exception as e:
@@ -540,29 +465,24 @@ def image_to_base64(image_path):
 def Check_ntp(config):
     global EXTRA_PROCESS_STATUS
     logger.info('Start Check NTP')
-    with ThreadPoolExecutor(max_workers=2) as executor: # เพิ่ม workers เป็น 2 เพื่อให้ทำงานพร้อมกันได้
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS_IO) as executor:
         try:
-            # ส่งงานไปให้ Thread และเก็บ Future object ไว้
             future_global_ntp = executor.submit(get_ntp_time, config.get('Global_NTP', 'pool.ntp.org'))
-            future_local_ntp = executor.submit(get_ntp_time, config.get('Local_NTP', 'time.google.com'))
+            future_local_ntp  = executor.submit(get_ntp_time, config.get('Local_NTP', 'time.google.com'))
 
-            # เรียก .result() เพื่อรอและดึงผลลัพธ์ที่แท้จริง
             global_ntp_time = future_global_ntp.result()
-            local_ntp_time = future_local_ntp.result()
+            local_ntp_time  = future_local_ntp.result()
 
-            # ตรวจสอบว่าได้ค่าเวลามาครบทั้งสองค่าหรือไม่ (กรณี timeout จะเป็น None)
             if global_ntp_time and local_ntp_time:
-                # ตอนนี้สามารถนำ datetime object มาคำนวณได้แล้ว
                 delta = abs((local_ntp_time - global_ntp_time).total_seconds())
 
-                if delta < 0.1 and delta > -0.1:
+                if delta < 0.1:
                     logger.info(f'NTP Status OK. Time difference: {delta:.4f} seconds')
                     EXTRA_PROCESS_STATUS.append({"processName": "Time Sync", "running": True})
                 else:
                     logger.warning(f'NTP Status Not OK. Time difference: {delta:.4f} seconds')
                     EXTRA_PROCESS_STATUS.append({"processName": "Time Sync", "running": False})
             else:
-                # กรณีมี NTP server ตัวใดตัวหนึ่งไม่ตอบสนอง
                 logger.error("NTP Status Not OK: Could not get time from one or both servers.")
                 EXTRA_PROCESS_STATUS.append({"processName": "Time Sync", "running": False})
 
@@ -575,44 +495,58 @@ def get_ntp_time(ntp_server):
     buf = 1024
     address = (ntp_server, port)
     msg = b'\x1b' + 47 * b'\0'
-
+    client = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
-        # สร้าง socket UDP
-        client = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         client.settimeout(5)
         client.sendto(msg, address)
-        msg, address = client.recvfrom(buf)
+        msg, _ = client.recvfrom(buf)
+        unpacked = struct.unpack("!12I", msg[0:48])
+        transmit_timestamp = unpacked[10] + float(unpacked[11]) / 2**32
+        ntp_time = datetime.utcfromtimestamp(transmit_timestamp - 2208988800)
+        return ntp_time
     except socket.timeout:
         logger.error(f"NTP Server Fail {ntp_server}")
         return None
-
-    # วิเคราะห์ค่าที่ได้
-    unpacked = struct.unpack("!12I", msg[0:48])
-    transmit_timestamp = unpacked[10] + float(unpacked[11]) / 2**32
-    ntp_time = datetime.utcfromtimestamp(transmit_timestamp - 2208988800)
-    return ntp_time
+    except Exception as e:
+        logger.error(f"NTP error ({ntp_server}): {e}")
+        return None
+    finally:
+        try:
+            client.close()
+        except Exception:
+            pass
 
 def main():
     """
     Main function that collects system metrics, prepares the JSON payload, and sends the data via API.
     """
     try:
-        request_body = prepare_request_body(config, extra_processes=EXTRA_PROCESS_STATUS)
-        url = config.get("url","")  # Default to empty string if not specified.
-        if  not url:
-            logger.error("API URL is not configured. Please check your config.json file.")
+        # 1) ตรวจ config สำคัญก่อน
+        url = config.get("url","")
+        if not url:
+            logger.critical("API URL is not configured. Please check your config.json file.")
             return
-        auth_user = config.get("auth_user", "")  # Default to empty string if not specified.
-        if not auth_user:       
-            logger.error("API auth_user is not configured. Please check your config.json file.")
+        auth_user = config.get("auth_user","")
+        if not auth_user:
+            logger.critical("API auth_user is not configured. Please check your config.json file.")
             return
-        auth_pass = config.get("auth_pass", "")  # Default to empty string if not specified.
+        auth_pass = config.get("auth_pass","")
         if not auth_pass:
-            logger.error("API auth_pass is not configured. Please check your config.json file.")
+            logger.critical("API auth_pass is not configured. Please check your config.json file.")
             return
+
+        # 2) สร้าง payload (รวมสถานะจาก EXTRA_PROCESS_STATUS ปัจจุบัน)
+        request_body = prepare_request_body(config, extra_processes=EXTRA_PROCESS_STATUS)
+
+        # 3) เคลียร์ EXTRA_PROCESS_STATUS หลัง “เก็บใส่ payload” แล้ว (กันซ้ำรอบหน้า)
         EXTRA_PROCESS_STATUS.clear()
-        logger.debug(f"Main function: Using URL: {url}, auth_user: {auth_user}")
-        status_code, response_json = send_api_request(url, request_body, auth_user, auth_pass)
+
+        # 4) ส่ง API โดยใช้ timeout/retries จาก config
+        timeout_sec = int(config.get("http_timeout_sec", 10))
+        retries     = int(config.get("http_retries", 2))
+        logger.debug(f"Main function: Using URL: {url}, auth_user: {auth_user}, timeout={timeout_sec}, retries={retries}")
+        status_code, response_json = send_api_request(url, request_body, auth_user, auth_pass, timeout_sec, retries)
+
         logger.info(f"Status Code: {status_code}")
         logger.info(f"Response: {response_json}")
     except Exception as e:
@@ -625,32 +559,28 @@ def keep_alive():
     logger.info('Keep Alive')
 
 if __name__ == "__main__":
-    # Load configuration and initialize logging.
-    config = Load_Config(default_config,Program_Name)
-    logger = Loguru_Logging(config, Program_Name, Program_Version)
-    logger.debug("Loaded configuration: {}", config)
-
+    
     # Cache the CPU count to avoid repeated calls.
     CPU_COUNT = os.cpu_count() or 1
-    logger.debug(f"CPU_COUNT = {CPU_COUNT}")
+    MAX_WORKERS_IO = min(CPU_COUNT * 2, 32)
+    logger.debug(f"CPU_COUNT = {CPU_COUNT}, MAX_WORKERS_IO = {MAX_WORKERS_IO}")
 
     logger.info(f"Starting scheduled tasks every {config.get('TimeSleep',360)} seconds")
     
     # For Windows support in frozen executables.
     multiprocessing.freeze_support()
 
-    # Run main() once immediately at startup.
+    # Run checks once at startup if enabled.
     if config.get("Check_ALPR_Enable", 0) == 1:
         logger.info("ALPR check is enabled. Running check_alpr()")
         check_alpr(config.get("DatabaseConfig"))
-        schedule.every(1).hours.do(check_alpr,config.get("DatabaseConfig"))
+        schedule.every(1).hours.do(check_alpr, config.get("DatabaseConfig"))
 
     if config.get("Check_ALPR_API_Enable", 0) == 1:
         logger.info("ALPR API check is enabled. Running Check_alpr_API()")
         Check_alpr_API()
         schedule.every(1).hours.do(Check_alpr_API)
     
-    # Check NTP status at startup.
     if config.get("Check_NTP_Enable", 0) == 1:
         logger.info("NTP check is enabled. Running Check_ntp()")
         Check_ntp(config)
@@ -659,12 +589,11 @@ if __name__ == "__main__":
     # Run main() once immediately at startup.
     main()
 
-    # Schedule main() to run every TimeSleep seconds.
+    # Schedule periodic jobs.
     schedule.every(int(config.get('TimeSleep',360))).seconds.do(main)
-    # Schedule keep_alive() to run every 60 seconds.
     schedule.every(60).seconds.do(keep_alive)
 
     # Main loop to run pending scheduled tasks.
     while True:
         schedule.run_pending()
-        time.sleep(10)
+        time.sleep(1)
