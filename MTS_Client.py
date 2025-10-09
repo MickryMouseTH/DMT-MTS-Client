@@ -265,7 +265,7 @@ def prepare_request_body(config_data, extra_processes=None):
         folders_info = get_folders_info(config_data.get("folders", []))
         logger.debug(f"Folders info collected: {folders_info}")
 
-        operating_system = platform.system() + " " + platform.release()
+        operating_system = platform.platform()
         logger.debug(f"Operating system: {operating_system}")
 
         request_body = {
