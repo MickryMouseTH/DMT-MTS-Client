@@ -7,6 +7,7 @@ import pymysql.cursors
 import platform
 import schedule
 import requests
+import hashlib
 import pymysql
 import psutil
 import base64
@@ -19,7 +20,7 @@ import os
 
 # ----------------------- Configuration Values -----------------------
 Program_Name = "MTS_Python"        # Program name for identification and logging.
-Program_Version = "3.3"            # Program version used for file naming and logging.
+Program_Version = "3.4"            # Program version used for file naming and logging.
 # ---------------------------------------------------------------------
 
 # Determine the directory of the script or executable.
@@ -420,6 +421,16 @@ def Check_alpr_API():
             logger.error(f"Unexpected error in Check_alpr_API: {e}")
             EXTRA_PROCESS_STATUS.append({"processName": "ALPR API", "running": False})
 
+def summarize_b64(b64_str: str, max_prefix=128):
+    raw = base64.b64decode(b64_str, validate=False)
+    sha = hashlib.sha256(raw).hexdigest()
+    return {
+        "alpr_image_prefix": b64_str[:max_prefix] + ("..." if len(b64_str) > max_prefix else ""),
+        "alpr_image_len": len(b64_str),
+        "alpr_image_sha256": sha,
+        "note": "truncated" if len(b64_str) > max_prefix else "full"
+    }
+
 def send_http_request(image_path, url):
     """Create and send an HTTP request."""
     try:
@@ -443,10 +454,10 @@ def send_http_request(image_path, url):
         }
 
         headers = {"Content-Type": "application/json"}
-        logger.debug(f"Sending HTTP request to {url} with payload: {payload}")
-
         response = requests.post(url, headers=headers, json=payload, timeout=10)
         response.raise_for_status()
+        payload["alpr_image_summary"] = summarize_b64(payload.pop("alpr_image"))
+        logger.debug(f"Sending HTTP request to {url} with payload: {payload}")
         return response.text
     except requests.RequestException as e:
         logger.error(f"HTTP request failed: {e}")
@@ -534,14 +545,27 @@ def main():
         if not auth_pass:
             logger.critical("API auth_pass is not configured. Please check your config.json file.")
             return
+        
+        # 2) Run checks once at startup if enabled.
+        if config.get("Check_ALPR_Enable", 0) == 1:
+            logger.info("ALPR check is enabled. Running check_alpr()")
+            check_alpr(config.get("DatabaseConfig"))
 
-        # 2) สร้าง payload (รวมสถานะจาก EXTRA_PROCESS_STATUS ปัจจุบัน)
+        if config.get("Check_ALPR_API_Enable", 0) == 1:
+            logger.info("ALPR API check is enabled. Running Check_alpr_API()")
+            Check_alpr_API()
+        
+        if config.get("Check_NTP_Enable", 0) == 1:
+            logger.info("NTP check is enabled. Running Check_ntp()")
+            Check_ntp(config)
+
+        # 3) สร้าง payload (รวมสถานะจาก EXTRA_PROCESS_STATUS ปัจจุบัน)
         request_body = prepare_request_body(config, extra_processes=EXTRA_PROCESS_STATUS)
 
-        # 3) เคลียร์ EXTRA_PROCESS_STATUS หลัง “เก็บใส่ payload” แล้ว (กันซ้ำรอบหน้า)
+        # 4) เคลียร์ EXTRA_PROCESS_STATUS หลัง “เก็บใส่ payload” แล้ว (กันซ้ำรอบหน้า)
         EXTRA_PROCESS_STATUS.clear()
 
-        # 4) ส่ง API โดยใช้ timeout/retries จาก config
+        # 5) ส่ง API โดยใช้ timeout/retries จาก config
         timeout_sec = int(config.get("http_timeout_sec", 10))
         retries     = int(config.get("http_retries", 2))
         logger.debug(f"Main function: Using URL: {url}, auth_user: {auth_user}, timeout={timeout_sec}, retries={retries}")
@@ -569,22 +593,6 @@ if __name__ == "__main__":
     
     # For Windows support in frozen executables.
     multiprocessing.freeze_support()
-
-    # Run checks once at startup if enabled.
-    if config.get("Check_ALPR_Enable", 0) == 1:
-        logger.info("ALPR check is enabled. Running check_alpr()")
-        check_alpr(config.get("DatabaseConfig"))
-        schedule.every(1).hours.do(check_alpr, config.get("DatabaseConfig"))
-
-    if config.get("Check_ALPR_API_Enable", 0) == 1:
-        logger.info("ALPR API check is enabled. Running Check_alpr_API()")
-        Check_alpr_API()
-        schedule.every(1).hours.do(Check_alpr_API)
-    
-    if config.get("Check_NTP_Enable", 0) == 1:
-        logger.info("NTP check is enabled. Running Check_ntp()")
-        Check_ntp(config)
-        schedule.every(1).hours.do(Check_ntp, config)
 
     # Run main() once immediately at startup.
     main()
