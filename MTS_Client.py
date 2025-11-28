@@ -20,14 +20,8 @@ import os
 
 # ----------------------- Configuration Values -----------------------
 Program_Name = "MTS_Python"        # Program name for identification and logging.
-Program_Version = "3.4"            # Program version used for file naming and logging.
+Program_Version = "3.5"            # Program version used for file naming and logging.
 # ---------------------------------------------------------------------
-
-# Determine the directory of the script or executable.
-if getattr(sys, 'frozen', False):
-    script_dir = os.path.dirname(sys.executable)
-else:
-    script_dir = os.path.dirname(os.path.abspath(__file__))
 
 default_config = {
     "url": "",                # API endpoint URL.
@@ -70,24 +64,46 @@ default_config = {
     "http_retries": 2
 }
 
-config = Load_Config(default_config, Program_Name, script_dir)
-logger = Loguru_Logging(config, Program_Name, Program_Version, script_dir)
+config = Load_Config(default_config, Program_Name)
+logger = Loguru_Logging(config, Program_Name, Program_Version)
 
 EXTRA_PROCESS_STATUS = []
 
 def get_disk_info():
     """
-    Retrieve disk usage information for each disk partition.
+    Retrieve disk usage information for each disk partition, excluding loop devices and virtual filesystems.
     """
     disks_info = []
+    # กำหนดประเภทอุปกรณ์/ระบบไฟล์ที่ต้องการกรองออก
+    EXCLUDE_FS_TYPES = ['squashfs', 'tmpfs', 'devtmpfs', 'fuse.gvfsd-fuse']
+    # กรอง loop devices, CD/DVD drives, และอุปกรณ์เสมือนที่ไม่ได้เมาท์แบบถาวร
+    EXCLUDE_PREFIX = ['/dev/loop', '/dev/sr', 'tmpfs', 'udev', 'devpts', 'overlay']
+
     for part in psutil.disk_partitions():
+        # 1. กรองระบบไฟล์เสมือนและประเภทที่ไม่ต้องการออก
+        if part.fstype in EXCLUDE_FS_TYPES:
+            logger.debug(f"Skipping virtual filesystem: {part.device} ({part.fstype})")
+            continue
+        
+        # 2. กรอง Loop devices และอุปกรณ์เสมือนอื่นๆ ออกจากการตรวจสอบชื่ออุปกรณ์
+        if part.device.startswith(tuple(EXCLUDE_PREFIX)):
+             logger.debug(f"Skipping loop device/virtual disk: {part.device}")
+             continue
+        
+        # กรอง Mount Point ที่ไม่จำเป็นออก (เช่น Mount Point ที่ไม่ได้เป็นโฟลเดอร์เก็บข้อมูลหลัก)
+        if part.mountpoint in ['/dev', '/sys', '/proc']:
+             logger.debug(f"Skipping system mount point: {part.mountpoint}")
+             continue
+
         try:
             usage = psutil.disk_usage(part.mountpoint)
             total_gb = usage.total / (1024**3)
             used_gb = usage.used / (1024**3)
             free_gb = usage.free / (1024**3)
             percent_used = usage.percent
+            
             logger.debug(f"Disk {part.device}: mountpoint={part.mountpoint}, total={total_gb:.2f}GB, used={used_gb:.2f}GB, free={free_gb:.2f}GB, percentUsed={percent_used}")
+            
             disks_info.append({
                 "disk": part.device,
                 "spaceGb": round(total_gb, 2),
@@ -98,6 +114,11 @@ def get_disk_info():
         except PermissionError as e:
             logger.error(f'PermissionError accessing {part.mountpoint}: {e}')
             continue
+        except Exception as e:
+            # ดักจับข้อผิดพลาดอื่น ๆ เช่น OSError หาก Mount Point เข้าถึงไม่ได้
+            logger.warning(f'Error processing disk partition {part.device} at {part.mountpoint}: {e}')
+            continue
+
     logger.info(f'Disk Info: {disks_info}')
     return disks_info
 
