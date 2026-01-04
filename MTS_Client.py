@@ -20,7 +20,7 @@ import os
 
 # ----------------------- Configuration Values -----------------------
 Program_Name = "MTS_Python"        # Program name for identification and logging.
-Program_Version = "3.5"            # Program version used for file naming and logging.
+Program_Version = "3.6"            # Program version used for file naming and logging.
 # ---------------------------------------------------------------------
 
 default_config = {
@@ -51,6 +51,7 @@ default_config = {
     "image_url": "",          # URL for the ALPR API endpoint.
     "Global_NTP": "pool.ntp.org",  # Global NTP server address.
     "Local_NTP": "time.google.com",  # Local NTP server address.
+    "NTP_Threshold_Seconds": 1,  # Maximum allowed time difference in seconds.
     "Check_ALPR_Enable": 0,   # Set to 1 to enable ALPR check.
     "Check_ALPR_API_Enable": 0,      # Set to 1 to enable ALPR API check.
     "Check_NTP_Enable": 0,   # Set to 1 to enable NTP check.
@@ -508,7 +509,7 @@ def Check_ntp(config):
             if global_ntp_time and local_ntp_time:
                 delta = abs((local_ntp_time - global_ntp_time).total_seconds())
 
-                if delta < 0.1:
+                if delta < config.get('NTP_Threshold_Seconds', 1):
                     logger.info(f'NTP Status OK. Time difference: {delta:.4f} seconds')
                     EXTRA_PROCESS_STATUS.append({"processName": "Time Sync", "running": True})
                 else:
