@@ -1,0 +1,18 @@
+# Core API server
+fastapi>=0.110
+uvicorn[standard]>=0.27
+SQLAlchemy>=2.0
+pydantic>=2.6
+loguru>=0.7              # used by the shared LogLibrary.py (logging + JSON config)
+
+# --- Database drivers: install ONLY the one matching your DB_Type ---
+# MySQL / MariaDB   (DB_Type=mysql)
+# pymysql>=1.1
+#
+# PostgreSQL        (DB_Type=postgresql)
+# psycopg2-binary>=2.9
+#
+# Microsoft SQL Server (DB_Type=mssql) -- also requires a system ODBC driver
+# pyodbc>=5.1
+#
+# SQLite (DB_Type=sqlite) needs no extra driver (built into Python).

@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+#
+# Start the MTS Monitoring API server in the background.
+# Host / Port / Workers / DB are all read from MTS_Server_config.json
+# (loaded by config.py via the shared LogLibrary).
+#
+set -euo pipefail
+
+# Always run from the server directory.
+cd "$(dirname "$0")"
+
+PIDFILE="server.pid"
+OUTLOG="server.out"
+
+# Prefer a local virtualenv if one exists, otherwise fall back to python3.
+if [ -x "venv/bin/python" ]; then
+    PY="venv/bin/python"
+elif [ -x ".venv/bin/python" ]; then
+    PY=".venv/bin/python"
+else
+    PY="$(command -v python3 || command -v python)"
+fi
+
+# Already running?
+if [ -f "$PIDFILE" ]; then
+    OLD_PID="$(cat "$PIDFILE" 2>/dev/null || true)"
+    if [ -n "${OLD_PID}" ] && kill -0 "$OLD_PID" 2>/dev/null; then
+        echo "MTS Server already running (PID $OLD_PID)."
+        exit 0
+    fi
+    # Stale pidfile; remove it.
+    rm -f "$PIDFILE"
+fi
+
+echo "Starting MTS Server using: $PY"
+nohup "$PY" main.py >> "$OUTLOG" 2>&1 &
+PID=$!
+echo "$PID" > "$PIDFILE"
+
+# Give it a moment, then verify it stayed up.
+sleep 2
+if kill -0 "$PID" 2>/dev/null; then
+    echo "MTS Server started (PID $PID). Output -> $OUTLOG"
+else
+    echo "ERROR: MTS Server failed to start. Check $OUTLOG:"
+    tail -n 20 "$OUTLOG" || true
+    rm -f "$PIDFILE"
+    exit 1
+fi

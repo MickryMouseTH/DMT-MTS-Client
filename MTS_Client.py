@@ -1,7 +1,7 @@
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from LogLibrary import Loguru_Logging, Load_Config
+from LogLibrary import Loguru_Logging, Load_Config, script_dir
 from requests.auth import HTTPBasicAuth
-from datetime import datetime,timedelta
+from datetime import datetime, timedelta, timezone
 import multiprocessing
 import pymysql.cursors
 import platform
@@ -20,7 +20,7 @@ import os
 
 # ----------------------- Configuration Values -----------------------
 Program_Name = "MTS_Python"        # Program name for identification and logging.
-Program_Version = "3.6"            # Program version used for file naming and logging.
+Program_Version = "3.7"            # Program version used for file naming and logging.
 # ---------------------------------------------------------------------
 
 default_config = {
@@ -67,6 +67,12 @@ default_config = {
 
 config = Load_Config(default_config, Program_Name)
 logger = Loguru_Logging(config, Program_Name, Program_Version)
+
+# Cache the CPU count once and derive an I/O worker cap. Defined at module
+# level (not inside __main__) so every function that references MAX_WORKERS_IO
+# works even when the module is imported or unit-tested.
+CPU_COUNT = os.cpu_count() or 1
+MAX_WORKERS_IO = min(CPU_COUNT * 2, 32)
 
 EXTRA_PROCESS_STATUS = []
 
@@ -151,63 +157,35 @@ def process_directory(directory):
         logger.error(f"Error scanning directory {directory}: {e}")
     return local_size, local_count, subdirs
 
-def process_subfolder(subfolder_path):
-    """
-    Concurrently process a subfolder using breadth-first search.
-    """
-    total_size = 0
-    total_count = 0
-    directories = [subfolder_path]
-    
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS_IO) as executor:
-        while directories:
-            futures = {executor.submit(process_directory, d): d for d in directories}
-            directories = []
-            for future in as_completed(futures):
-                try:
-                    size, count, subdirs = future.result()
-                    total_size += size
-                    total_count += count
-                    directories.extend(subdirs)
-                except Exception as e:
-                    logger.error(f"Error processing subfolder {futures[future]}: {e}")
-    logger.debug(f"Finished processing subfolder (optimized): {subfolder_path} with total size: {total_size} bytes and file count: {total_count}")
-    return {"size": total_size, "count": total_count}
-
 def get_folder_info(folder_path):
     """
     Retrieve file count and total file size (in kilobytes) for a given folder.
+
+    Walks the whole tree breadth-first using a SINGLE thread pool. Earlier
+    versions nested three pools (get_folders_info -> get_folder_info ->
+    process_subfolder), which spawned O(workers^3) threads on deep trees; this
+    single-level walk keeps concurrency bounded to MAX_WORKERS_IO.
     """
     logger.debug(f"Start processing folder: {folder_path}")
     total_size = 0
     file_count = 0
     total_size_kb = 0.0
 
-    subfolders = []
     try:
-        with os.scandir(folder_path) as it:
-            for entry in it:
-                if entry.is_file(follow_symlinks=False):
-                    file_count += 1
-                    try:
-                        file_size = entry.stat().st_size
-                        total_size += file_size
-                    except Exception as e:
-                        logger.error(f"Error getting size for file {entry.path}: {e}")
-                elif entry.is_dir(follow_symlinks=False):
-                    subfolders.append(entry.path)
-                    logger.debug(f"Found directory: {entry.path}")
-
+        directories = [folder_path]
         with ThreadPoolExecutor(max_workers=MAX_WORKERS_IO) as executor:
-            future_to_subfolder = {executor.submit(process_subfolder, subfolder): subfolder for subfolder in subfolders}
-            for future in as_completed(future_to_subfolder):
-                try:
-                    result = future.result()
-                    total_size += result["size"]
-                    file_count += result["count"]
-                    logger.debug(f"Processed subfolder: {future_to_subfolder[future]} with result: {result}")
-                except Exception as e:
-                    logger.error(f"Error processing subfolder {future_to_subfolder[future]}: {e}")
+            while directories:
+                futures = {executor.submit(process_directory, d): d for d in directories}
+                directories = []
+                for future in as_completed(futures):
+                    try:
+                        size, count, subdirs = future.result()
+                        total_size += size
+                        file_count += count
+                        directories.extend(subdirs)
+                    except Exception as e:
+                        logger.error(f"Error processing directory {futures[future]}: {e}")
+
         total_size_kb = round(total_size / 1024, 2)
         logger.info(f"Folder Path: {folder_path}")
         logger.info(f"File Count: {file_count}")
@@ -218,39 +196,73 @@ def get_folder_info(folder_path):
     folder_info = {
         "pathFolder": folder_path,
         "fileCount": file_count,
-        "fileSiteKilobyte": total_size_kb  # คีย์เดิม
+        "fileSiteKilobyte": total_size_kb  # คีย์เดิม (legacy, สะกดผิดไว้เพื่อความเข้ากันได้)
     }
     folder_info["fileSizeKilobyte"] = total_size_kb  # alias ใหม่ เผื่อระบบใหม่
     return folder_info
 
-def check_process_running(process_name):
-    target = (process_name or "").lower()
+def snapshot_running_processes():
+    """
+    Take a one-shot snapshot of running processes.
+
+    Returns a (names, exe_basenames) tuple of lowercased sets. Building this
+    once per cycle avoids calling the expensive psutil.process_iter() syscall
+    repeatedly — once per configured process — which is what the previous
+    per-process check did.
+    """
+    names = set()
+    exe_basenames = set()
     for proc in psutil.process_iter(['name', 'exe']):
         try:
             name = (proc.info.get('name') or "").lower()
-            exe  = (proc.info.get('exe') or "").lower()
-            if target and (target == name or target in os.path.basename(exe)):
-                return True
+            if name:
+                names.add(name)
+            exe = (proc.info.get('exe') or "").lower()
+            if exe:
+                exe_basenames.add(os.path.basename(exe))
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             continue
-    return False
+    return names, exe_basenames
+
+def is_process_running(process_name, snapshot):
+    """
+    Check a process against a snapshot from snapshot_running_processes().
+
+    Matching is identical to the original check: an exact match on the process
+    name, OR the target appearing as a substring of an executable's basename.
+    """
+    target = (process_name or "").lower()
+    if not target:
+        return False
+    names, exe_basenames = snapshot
+    if target in names:
+        return True
+    return any(target in basename for basename in exe_basenames)
+
+def check_process_running(process_name):
+    """Backward-compatible single-process check (takes its own snapshot)."""
+    return is_process_running(process_name, snapshot_running_processes())
 
 def get_folders_info(folder_paths):
     """
-    Process a list of folders concurrently to collect file count and size for each folder.
+    Collect file count and size for each configured folder.
+
+    Folders are processed one at a time; each folder's tree walk is already
+    parallelised inside get_folder_info(). Keeping this loop sequential avoids
+    nesting thread pools (which previously caused thread-count explosion) while
+    still using all workers for the I/O-bound directory walk.
     """
     logger.info(f"Processing folders: {folder_paths}")
     results = []
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS_IO) as executor:
-        future_to_folder = {executor.submit(get_folder_info, folder): folder for folder in folder_paths}
-        for future in as_completed(future_to_folder):
-            folder_path = future_to_folder[future]
-            try:
-                result = future.result()
-                results.append(result)
-                logger.info(f"Processed folder: {folder_path} with result: {result}")
-            except Exception as e:
-                logger.error(f"Error processing folder {folder_path}: {e}")
+    for folder_path in folder_paths:
+        if not folder_path:
+            continue
+        try:
+            result = get_folder_info(folder_path)
+            results.append(result)
+            logger.info(f"Processed folder: {folder_path} with result: {result}")
+        except Exception as e:
+            logger.error(f"Error processing folder {folder_path}: {e}")
     logger.debug(f"Final folders info: {results}")
     return results
 
@@ -265,10 +277,13 @@ def prepare_request_body(config_data, extra_processes=None):
         uptime_minutes = round(uptime_seconds / 60)
         logger.debug(f"Boot time: {boot_time}, Current time: {current_time}, Uptime seconds: {uptime_seconds}, Uptime minutes: {uptime_minutes}")
 
+        # Snapshot running processes ONCE, then check each configured process
+        # against it in memory (instead of re-scanning the system per process).
+        process_snapshot = snapshot_running_processes()
         processes = [
             {
                 "processName": proc["processName"],
-                "running": check_process_running(proc["processApp"])
+                "running": is_process_running(proc["processApp"], process_snapshot)
             }
             for proc in config_data.get("process", [])
         ]
@@ -310,7 +325,10 @@ def prepare_request_body(config_data, extra_processes=None):
             request_body["tsbId"] = config_data["tsbId"]
             logger.debug(f"tsbId provided: {config_data['tsbId']}")
         else:
-            log_folder_info = get_folder_info("logs")
+            # Use an absolute path: logs live next to the script/executable, not
+            # in the current working directory (which may differ under a service).
+            log_dir = os.path.join(script_dir, "logs")
+            log_folder_info = get_folder_info(log_dir)
             request_body["logSizeKilobyte"] = log_folder_info["fileSiteKilobyte"]
             logger.debug(f"No tsbId provided; using log folder size: {log_folder_info['fileSiteKilobyte']} KB")
 
@@ -359,10 +377,11 @@ def check_alpr(config):
     try:
         logger.info("Starting connection to MySQL using PyMySQL")
         db_conn = pymysql.connect(
-            host=config["host"],
-            user=config["user"],
-            password=config["password"],
-            database=config["databaseName"],
+            host=config.get("host", ""),
+            user=config.get("user", ""),
+            password=config.get("password", ""),
+            database=config.get("databaseName", ""),
+            connect_timeout=10,
             cursorclass=pymysql.cursors.DictCursor
         )
         logger.info("Connected to MySQL successfully with PyMySQL")
@@ -384,9 +403,9 @@ def check_alpr(config):
         db_results_map = {row['LaneName']: row for row in db_results}
 
         for lane_config in lanes_to_check:
-            lane_name = lane_config["LaneName"]
+            lane_name = lane_config.get("LaneName", "")
             lane_Show = "ALPR " + lane_name
-            check_houes = lane_config["CheckHours"]
+            check_houes = lane_config.get("CheckHours", 1)
             running_status = False
 
             if lane_name in db_results_map:
@@ -407,7 +426,7 @@ def check_alpr(config):
         logger.error(f'An error occurred in check_alpr: {e}')
         lanes_to_check = config.get("dataCheck", [])
         for lane_config in lanes_to_check:
-             lane_Show = "ALPR " + lane_config["LaneName"]
+             lane_Show = "ALPR " + lane_config.get("LaneName", "")
              EXTRA_PROCESS_STATUS.append({"processName": lane_Show, "running": False})
     finally:
         if db_conn:
@@ -476,10 +495,15 @@ def send_http_request(image_path, url):
         }
 
         headers = {"Content-Type": "application/json"}
-        response = requests.post(url, headers=headers, json=payload, timeout=10)
+
+        # Log a redacted summary (without the full base64 image) before sending.
+        log_payload = dict(payload)
+        log_payload["alpr_image_summary"] = summarize_b64(log_payload.pop("alpr_image"))
+        logger.debug(f"Sending HTTP request to {url} with payload: {log_payload}")
+
+        timeout_sec = int(config.get("http_timeout_sec", 10))
+        response = requests.post(url, headers=headers, json=payload, timeout=timeout_sec)
         response.raise_for_status()
-        payload["alpr_image_summary"] = summarize_b64(payload.pop("alpr_image"))
-        logger.debug(f"Sending HTTP request to {url} with payload: {payload}")
         return response.text
     except requests.RequestException as e:
         logger.error(f"HTTP request failed: {e}")
@@ -535,7 +559,8 @@ def get_ntp_time(ntp_server):
         msg, _ = client.recvfrom(buf)
         unpacked = struct.unpack("!12I", msg[0:48])
         transmit_timestamp = unpacked[10] + float(unpacked[11]) / 2**32
-        ntp_time = datetime.utcfromtimestamp(transmit_timestamp - 2208988800)
+        # utcfromtimestamp() is deprecated; build a timezone-aware UTC datetime.
+        ntp_time = datetime.fromtimestamp(transmit_timestamp - 2208988800, tz=timezone.utc)
         return ntp_time
     except socket.timeout:
         logger.error(f"NTP Server Fail {ntp_server}")
@@ -605,10 +630,7 @@ def keep_alive():
     logger.info('Keep Alive')
 
 if __name__ == "__main__":
-    
-    # Cache the CPU count to avoid repeated calls.
-    CPU_COUNT = os.cpu_count() or 1
-    MAX_WORKERS_IO = min(CPU_COUNT * 2, 32)
+
     logger.debug(f"CPU_COUNT = {CPU_COUNT}, MAX_WORKERS_IO = {MAX_WORKERS_IO}")
 
     logger.info(f"Starting scheduled tasks every {config.get('TimeSleep',360)} seconds")
@@ -623,7 +645,11 @@ if __name__ == "__main__":
     schedule.every(int(config.get('TimeSleep',360))).seconds.do(main)
     schedule.every(60).seconds.do(keep_alive)
 
-    # Main loop to run pending scheduled tasks.
+    # Main loop to run pending scheduled tasks. Guard against unexpected errors
+    # so a transient failure never terminates this long-running agent.
     while True:
-        schedule.run_pending()
+        try:
+            schedule.run_pending()
+        except Exception as e:
+            logger.error(f"Error in scheduler loop: {e}")
         time.sleep(1)

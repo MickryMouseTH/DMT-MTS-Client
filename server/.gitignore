@@ -1,0 +1,13 @@
+# Generated config (contains credentials) and runtime files
+MTS_Server_config.json
+logs/
+*.db
+*.sqlite
+server.pid
+server.out
+
+# Python / venv
+__pycache__/
+*.pyc
+venv/
+.venv/
