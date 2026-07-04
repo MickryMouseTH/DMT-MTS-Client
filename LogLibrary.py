@@ -89,6 +89,20 @@ def _write_config(config_path, config):
     os.replace(tmp_path, config_path)
 
 
+def _safe_write_config(config_path, config):
+    """Write `config` but never raise — log to stderr on failure.
+
+    Used where a failed write must not crash the host application (e.g. while
+    recreating a config file after a corrupt one was backed up).
+    """
+    try:
+        _write_config(config_path, config)
+    except OSError as exc:
+        sys.stderr.write(
+            f'[LogLibrary] Failed to write config "{config_path}" ({exc}).\n'
+        )
+
+
 def _write_key_file(key_path, key_bytes):
     """Atomically write the Fernet key to `key_path` with owner-only perms.
 
@@ -253,6 +267,12 @@ def _apply_secret_encryption(config, config_path, force_write, key_path):
         key_path: Path to the persistent Fernet key file for this program.
     """
     if not _config_has_secret(config):
+        # No secrets to encrypt, but still (re)write the file when force_write is
+        # set — e.g. when recreating a config after a corrupt one was backed up.
+        # Without this the config file would be left MISSING (renamed to .bak and
+        # never regenerated) because there were no secrets to trigger a write.
+        if force_write:
+            _safe_write_config(config_path, config)
         return config
 
     if not _HAS_CRYPTO:
@@ -260,6 +280,8 @@ def _apply_secret_encryption(config, config_path, force_write, key_path):
             '[LogLibrary] Secret keys found but "cryptography" is not installed; '
             'storing values as plaintext. Run: pip install cryptography\n'
         )
+        if force_write:
+            _safe_write_config(config_path, config)
         return config
 
     fernet, generated = _resolve_fernet(key_path)

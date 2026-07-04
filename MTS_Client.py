@@ -20,7 +20,7 @@ import os
 
 # ----------------------- Configuration Values -----------------------
 Program_Name = "MTS_Python"        # Program name for identification and logging.
-Program_Version = "3.8"            # Program version used for file naming and logging.
+Program_Version = "3.9"            # Program version used for file naming and logging.
 # ---------------------------------------------------------------------
 
 default_config = {
