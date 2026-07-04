@@ -1,10 +1,17 @@
 # Generated config (contains credentials) and runtime files
 MTS_Server_config.json
+*.key
+*.bak
 logs/
 *.db
 *.sqlite
 server.pid
 server.out
+
+# PyInstaller build artifacts
+build/
+dist/
+*.spec
 
 # Python / venv
 __pycache__/

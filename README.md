@@ -5,7 +5,7 @@
 (License Plate Recognition) และการ Sync เวลา (NTP) แล้วส่งข้อมูลทั้งหมดไปยัง Server
 ผ่าน HTTP API ตามรอบเวลาที่กำหนด
 
-- **Version:** 3.7
+- **Version:** 3.8
 - **ภาษา:** Python 3 (ทดสอบบน Python 3.13)
 - **ไฟล์หลัก:** `MTS_Client.py`, `LogLibrary.py`
 

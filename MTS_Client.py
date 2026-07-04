@@ -20,7 +20,7 @@ import os
 
 # ----------------------- Configuration Values -----------------------
 Program_Name = "MTS_Python"        # Program name for identification and logging.
-Program_Version = "3.7"            # Program version used for file naming and logging.
+Program_Version = "3.8"            # Program version used for file naming and logging.
 # ---------------------------------------------------------------------
 
 default_config = {
@@ -74,6 +74,21 @@ logger = Loguru_Logging(config, Program_Name, Program_Version)
 CPU_COUNT = os.cpu_count() or 1
 MAX_WORKERS_IO = min(CPU_COUNT * 2, 32)
 
+# Resolve once whether DEBUG-level logging is active. Python evaluates the
+# f-string argument to logger.debug(...) BEFORE the call, so a debug log in a
+# hot loop still pays the string-building cost even when the level is INFO.
+# Guarding hot-path debug logs with `if DEBUG_ENABLED` keeps INFO runs fast:
+#   - DEBUG: log every step, in full detail.
+#   - INFO : only concise summaries; no expensive strings are ever built.
+def _debug_enabled():
+    try:
+        current = logger.level(str(config.get("log_Level", "DEBUG")).strip().upper()).no
+        return current <= logger.level("DEBUG").no
+    except (ValueError, TypeError):
+        return True  # unknown level name -> be safe and keep debug on
+
+DEBUG_ENABLED = _debug_enabled()
+
 EXTRA_PROCESS_STATUS = []
 
 def get_disk_info():
@@ -126,7 +141,10 @@ def get_disk_info():
             logger.warning(f'Error processing disk partition {part.device} at {part.mountpoint}: {e}')
             continue
 
-    logger.info(f'Disk Info: {disks_info}')
+    # INFO: concise summary only. Full per-disk data stays at DEBUG (logged above).
+    logger.info(f'Disk info collected: {len(disks_info)} partition(s)')
+    if DEBUG_ENABLED:
+        logger.debug(f'Disk Info (full): {disks_info}')
     return disks_info
 
 def process_directory(directory):
@@ -145,14 +163,14 @@ def process_directory(directory):
                         file_size = entry.stat().st_size
                         local_size += file_size
                         local_count += 1
-                        # ลด spam log: คอมเมนต์ไว้ถ้าต้องการ
-                        # if local_count % 1000 == 0:
-                        #     logger.debug(f"[{directory}] processed {local_count} files")
                     except Exception as e:
                         logger.error(f"Error getting size for file {entry.path}: {e}")
                 elif entry.is_dir(follow_symlinks=False):
                     subdirs.append(entry.path)
-                    logger.debug(f"Found subdirectory: {entry.path}")
+                    # Hot path: only build the per-subdirectory message when DEBUG
+                    # is actually on, so INFO runs never pay the string cost.
+                    if DEBUG_ENABLED:
+                        logger.debug(f"Found subdirectory: {entry.path}")
     except Exception as e:
         logger.error(f"Error scanning directory {directory}: {e}")
     return local_size, local_count, subdirs
@@ -187,9 +205,8 @@ def get_folder_info(folder_path):
                         logger.error(f"Error processing directory {futures[future]}: {e}")
 
         total_size_kb = round(total_size / 1024, 2)
-        logger.info(f"Folder Path: {folder_path}")
-        logger.info(f"File Count: {file_count}")
-        logger.info(f"Total File Size (KB): {total_size_kb}")
+        # INFO: one concise summary line per folder (fast to write).
+        logger.info(f"Folder '{folder_path}': {file_count} files, {total_size_kb} KB")
     except Exception as e:
         logger.error(f"Error processing folder {folder_path}: {e}")
     logger.debug(f"Finished processing folder: {folder_path}")
@@ -260,11 +277,78 @@ def get_folders_info(folder_paths):
         try:
             result = get_folder_info(folder_path)
             results.append(result)
-            logger.info(f"Processed folder: {folder_path} with result: {result}")
+            logger.debug(f"Processed folder: {folder_path} with result: {result}")
         except Exception as e:
             logger.error(f"Error processing folder {folder_path}: {e}")
     logger.debug(f"Final folders info: {results}")
     return results
+
+def _path_birth_time(path):
+    """
+    Return the best available "creation" timestamp for `path`.
+
+    Prefers the real birth time where the platform/filesystem exposes it
+    (st_birthtime on Windows/macOS and newer Linux), otherwise falls back to
+    the inode-change time (st_ctime) and finally the modification time.
+    """
+    st = os.stat(path)
+    for attr in ("st_birthtime", "st_ctime"):
+        ts = getattr(st, attr, None)
+        if ts:
+            return ts
+    return st.st_mtime
+
+def get_os_install_date():
+    """
+    Best-effort detection of when the OS was (most recently) installed.
+
+    Returned as a compact "YYYYMMDD" string, or "" when it cannot be determined
+    (so the caller simply omits it). Detection strategy per platform:
+      - Windows: the registry value InstallDate under
+        HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion. This is refreshed
+        by feature upgrades, so it reflects the LATEST install/upgrade. Falls
+        back to the creation time of the Windows directory (%SystemRoot%).
+      - macOS  : creation time of /var/db/.AppleSetupDone (written at setup),
+        falling back to the root volume's creation time.
+      - Linux  : birth/creation time of a stable, install-time path
+        (/lost+found is created by mkfs, a good proxy for the install date),
+        falling back to /etc or /.
+    """
+    system = platform.system()
+    try:
+        if system == "Windows":
+            try:
+                import winreg
+                with winreg.OpenKey(
+                    winreg.HKEY_LOCAL_MACHINE,
+                    r"SOFTWARE\Microsoft\Windows NT\CurrentVersion",
+                ) as key:
+                    install_ts, _ = winreg.QueryValueEx(key, "InstallDate")
+                return datetime.fromtimestamp(int(install_ts)).strftime("%Y%m%d")
+            except (OSError, ValueError, ImportError) as e:
+                logger.debug(f"Registry InstallDate unavailable ({e}); using Windows dir ctime.")
+                win_dir = os.environ.get("SystemRoot", r"C:\Windows")
+                return datetime.fromtimestamp(_path_birth_time(win_dir)).strftime("%Y%m%d")
+
+        if system == "Darwin":
+            candidates = ("/var/db/.AppleSetupDone", "/private/var/db/.AppleSetupDone", "/")
+        else:
+            # Linux / other POSIX
+            candidates = ("/lost+found", "/etc/hostname", "/etc", "/")
+
+        for marker in candidates:
+            if os.path.exists(marker):
+                ts = _path_birth_time(marker)
+                if ts:
+                    return datetime.fromtimestamp(ts).strftime("%Y%m%d")
+    except Exception as e:
+        logger.warning(f"Could not determine OS install date: {e}")
+    return ""
+
+# OS install date does not change while the agent runs, so resolve it once at
+# startup instead of on every reporting cycle (keeps the hot path fast).
+OS_INSTALL_DATE = get_os_install_date()
+logger.debug(f"Detected OS install date: {OS_INSTALL_DATE or 'unknown'}")
 
 def prepare_request_body(config_data, extra_processes=None):
     """
@@ -303,7 +387,11 @@ def prepare_request_body(config_data, extra_processes=None):
         folders_info = get_folders_info(config_data.get("folders", []))
         logger.debug(f"Folders info collected: {folders_info}")
 
+        # Append the OS install date (YYYYMMDD) when known, e.g.
+        # "Windows-11-10.0.26200-SP0_20260114". Omitted when undetectable.
         operating_system = platform.platform()
+        if OS_INSTALL_DATE:
+            operating_system = f"{operating_system}_{OS_INSTALL_DATE}"
         logger.debug(f"Operating system: {operating_system}")
 
         request_body = {
@@ -319,7 +407,6 @@ def prepare_request_body(config_data, extra_processes=None):
             "process": processes,
             "operatingSystem": operating_system
         }
-        logger.debug(f"Initial request_body: {request_body}")
 
         if config_data.get("tsbId", ""):
             request_body["tsbId"] = config_data["tsbId"]
@@ -332,7 +419,16 @@ def prepare_request_body(config_data, extra_processes=None):
             request_body["logSizeKilobyte"] = log_folder_info["fileSiteKilobyte"]
             logger.debug(f"No tsbId provided; using log folder size: {log_folder_info['fileSiteKilobyte']} KB")
 
-        logger.info(f"Request Body: {request_body}")
+        # INFO: short, fast-to-write summary of what will be sent.
+        logger.info(
+            f"Report ready: device={request_body['deviceName']}, "
+            f"appRunning={request_body['appRunning']}, cpu={cpu_usage}%, "
+            f"ram={request_body['percentRamUsage']}%, uptime={uptime_minutes}m, "
+            f"disks={len(disks)}, folders={len(folders_info)}, process={len(processes)}"
+        )
+        # DEBUG: full payload, only built when debug is actually enabled.
+        if DEBUG_ENABLED:
+            logger.debug(f"Request Body (full): {request_body}")
     except Exception as e:
         logger.error(f"Error preparing request body: {e}")
         request_body = {}
@@ -343,6 +439,7 @@ def send_api_request(url, request_body, auth_user, auth_pass, timeout_sec=10, re
     last_err = None
     for attempt in range(retries + 1):
         try:
+            logger.debug(f"POST {url} (attempt {attempt + 1}/{retries + 1}, timeout={timeout_sec}s)")
             resp = requests.post(
                 url, headers=headers, json=request_body,
                 auth=HTTPBasicAuth(auth_user, auth_pass),
@@ -375,7 +472,7 @@ def check_alpr(config):
         return
 
     try:
-        logger.info("Starting connection to MySQL using PyMySQL")
+        logger.debug("Starting connection to MySQL using PyMySQL")
         db_conn = pymysql.connect(
             host=config.get("host", ""),
             user=config.get("user", ""),
@@ -384,7 +481,7 @@ def check_alpr(config):
             connect_timeout=10,
             cursorclass=pymysql.cursors.DictCursor
         )
-        logger.info("Connected to MySQL successfully with PyMySQL")
+        logger.debug("Connected to MySQL successfully with PyMySQL")
         
         with db_conn.cursor() as cursor:
             query = """
@@ -431,8 +528,8 @@ def check_alpr(config):
     finally:
         if db_conn:
             db_conn.close()
-            logger.info("MySQL connection closed.")
-    
+            logger.debug("MySQL connection closed.")
+
     logger.debug(f"Final ALPR Status: {EXTRA_PROCESS_STATUS}")
 
 def Check_alpr_API():
@@ -612,14 +709,22 @@ def main():
         # 4) เคลียร์ EXTRA_PROCESS_STATUS หลัง “เก็บใส่ payload” แล้ว (กันซ้ำรอบหน้า)
         EXTRA_PROCESS_STATUS.clear()
 
-        # 5) ส่ง API โดยใช้ timeout/retries จาก config
+        # 4.1) ถ้าประกอบ payload ไม่สำเร็จ (เกิด exception ภายใน) จะได้ {} — ไม่ส่งเปล่า
+        if not request_body:
+            logger.error("Skipping send: request body is empty (failed to build payload).")
+            return
+
+        # 5) ส่ง API โดยใช้ timeout/retries จาก config (ไม่ log auth_user/auth_pass)
         timeout_sec = int(config.get("http_timeout_sec", 10))
         retries     = int(config.get("http_retries", 2))
-        logger.debug(f"Main function: Using URL: {url}, auth_user: {auth_user}, timeout={timeout_sec}, retries={retries}")
+        logger.debug(f"Main: sending report to {url} (timeout={timeout_sec}s, retries={retries})")
         status_code, response_json = send_api_request(url, request_body, auth_user, auth_pass, timeout_sec, retries)
 
-        logger.info(f"Status Code: {status_code}")
-        logger.info(f"Response: {response_json}")
+        if status_code is None:
+            logger.error(f"Send failed after retries: {response_json}")
+        else:
+            logger.info(f"Report sent: status={status_code}")
+            logger.debug(f"Response: {response_json}")
     except Exception as e:
         logger.error(f"Error in main execution: {e}")
 
