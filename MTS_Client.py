@@ -20,7 +20,7 @@ import os
 
 # ----------------------- Configuration Values -----------------------
 Program_Name = "MTS_Python"        # Program name for identification and logging.
-Program_Version = "3.9"            # Program version used for file naming and logging.
+Program_Version = "4.0"            # Program version used for file naming and logging.
 # ---------------------------------------------------------------------
 
 default_config = {
@@ -298,37 +298,99 @@ def _path_birth_time(path):
             return ts
     return st.st_mtime
 
-def get_os_install_date():
-    """
-    Best-effort detection of when the OS was (most recently) installed.
+def _windows_install_date():
+    """OS install/upgrade date (YYYYMMDD) on Windows, or "".
 
-    Returned as a compact "YYYYMMDD" string, or "" when it cannot be determined
-    (so the caller simply omits it). Detection strategy per platform:
-      - Windows: the registry value InstallDate under
-        HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion. This is refreshed
-        by feature upgrades, so it reflects the LATEST install/upgrade. Falls
-        back to the creation time of the Windows directory (%SystemRoot%).
-      - macOS  : creation time of /var/db/.AppleSetupDone (written at setup),
-        falling back to the root volume's creation time.
-      - Linux  : birth/creation time of a stable, install-time path
-        (/lost+found is created by mkfs, a good proxy for the install date),
-        falling back to /etc or /.
+    Reads the registry value InstallDate under
+    HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion (refreshed by feature
+    upgrades), falling back to the creation time of %SystemRoot%.
+    """
+    try:
+        import winreg
+        with winreg.OpenKey(
+            winreg.HKEY_LOCAL_MACHINE,
+            r"SOFTWARE\Microsoft\Windows NT\CurrentVersion",
+        ) as key:
+            install_ts, _ = winreg.QueryValueEx(key, "InstallDate")
+        return datetime.fromtimestamp(int(install_ts)).strftime("%Y%m%d")
+    except (OSError, ValueError, ImportError) as e:
+        logger.debug(f"Registry InstallDate unavailable ({e}); using Windows dir ctime.")
+        try:
+            win_dir = os.environ.get("SystemRoot", r"C:\Windows")
+            return datetime.fromtimestamp(_path_birth_time(win_dir)).strftime("%Y%m%d")
+        except OSError as e2:
+            logger.debug(f"Windows dir ctime unavailable ({e2}).")
+            return ""
+
+def _windows_last_update_date():
+    """Date (YYYYMMDD) of the most recent Windows cumulative/quality update, or "".
+
+    Used to monitor machines that have NOT been patched recently. Strategy:
+      1. Registry: the Automatic Updates 'LastSuccessTime' under
+         HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\WindowsUpdate\\
+         Auto Update\\Results\\Install — the last time Windows Update
+         successfully installed updates (stored as "YYYY-MM-DD HH:MM:SS").
+      2. Fallback: the newest hotfix 'InstalledOn' reported by Get-HotFix, which
+         covers WSUS/SCCM-managed machines where the Auto Update result may be
+         missing. Run once at startup only.
+    """
+    # 1) Registry LastSuccessTime (fast, no subprocess). Try the native 64-bit
+    #    view first so a 32-bit frozen build still reads the real key.
+    try:
+        import winreg
+        for view in (winreg.KEY_WOW64_64KEY, 0):
+            try:
+                with winreg.OpenKey(
+                    winreg.HKEY_LOCAL_MACHINE,
+                    r"SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\Results\Install",
+                    0, winreg.KEY_READ | view,
+                ) as key:
+                    val, _ = winreg.QueryValueEx(key, "LastSuccessTime")
+                val = (val or "").strip()
+                if val:
+                    tag = datetime.strptime(val[:10], "%Y-%m-%d").strftime("%Y%m%d")
+                    logger.debug(f"Windows last update (LastSuccessTime={val}) -> {tag}")
+                    return tag
+            except (OSError, ValueError):
+                continue
+    except ImportError:
+        pass
+
+    # 2) Fallback: newest installed hotfix date via PowerShell Get-HotFix.
+    try:
+        import subprocess
+        # CREATE_NO_WINDOW (0x08000000) stops a console flashing under a GUI/service.
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+             "$u=(Get-HotFix | Where-Object InstalledOn | Sort-Object InstalledOn | "
+             "Select-Object -Last 1).InstalledOn; if($u){$u.ToString('yyyyMMdd')}"],
+            capture_output=True, text=True, timeout=20, creationflags=0x08000000,
+        )
+        tag = (result.stdout or "").strip()
+        if len(tag) == 8 and tag.isdigit():
+            logger.debug(f"Windows last update (Get-HotFix) -> {tag}")
+            return tag
+        logger.debug(f"Get-HotFix returned no usable date (stdout={tag!r}).")
+    except Exception as e:
+        logger.debug(f"Get-HotFix fallback failed: {e}")
+    return ""
+
+def get_os_datestamp():
+    """
+    Date stamp (YYYYMMDD) appended to `operatingSystem`, or "" when unknown.
+
+    Semantics differ by platform so the value is useful for monitoring:
+      - Windows: the date of the LATEST cumulative/quality update, so the server
+        can flag machines that have not been patched recently. Falls back to the
+        OS install/upgrade date when the update date can't be read.
+      - macOS  : OS install date (creation of /var/db/.AppleSetupDone, else /).
+      - Linux  : OS install date (birth/ctime of /lost+found — created by mkfs —
+        falling back to /etc or /).
     """
     system = platform.system()
     try:
         if system == "Windows":
-            try:
-                import winreg
-                with winreg.OpenKey(
-                    winreg.HKEY_LOCAL_MACHINE,
-                    r"SOFTWARE\Microsoft\Windows NT\CurrentVersion",
-                ) as key:
-                    install_ts, _ = winreg.QueryValueEx(key, "InstallDate")
-                return datetime.fromtimestamp(int(install_ts)).strftime("%Y%m%d")
-            except (OSError, ValueError, ImportError) as e:
-                logger.debug(f"Registry InstallDate unavailable ({e}); using Windows dir ctime.")
-                win_dir = os.environ.get("SystemRoot", r"C:\Windows")
-                return datetime.fromtimestamp(_path_birth_time(win_dir)).strftime("%Y%m%d")
+            return _windows_last_update_date() or _windows_install_date()
 
         if system == "Darwin":
             candidates = ("/var/db/.AppleSetupDone", "/private/var/db/.AppleSetupDone", "/")
@@ -342,13 +404,14 @@ def get_os_install_date():
                 if ts:
                     return datetime.fromtimestamp(ts).strftime("%Y%m%d")
     except Exception as e:
-        logger.warning(f"Could not determine OS install date: {e}")
+        logger.warning(f"Could not determine OS date stamp: {e}")
     return ""
 
-# OS install date does not change while the agent runs, so resolve it once at
-# startup instead of on every reporting cycle (keeps the hot path fast).
-OS_INSTALL_DATE = get_os_install_date()
-logger.debug(f"Detected OS install date: {OS_INSTALL_DATE or 'unknown'}")
+# The date stamp does not change while the agent runs, so resolve it once at
+# startup instead of on every reporting cycle (keeps the hot path fast; the
+# Windows Get-HotFix fallback also runs at most once).
+OS_DATESTAMP = get_os_datestamp()
+logger.debug(f"OS date stamp (Windows=last update / else install): {OS_DATESTAMP or 'unknown'}")
 
 def prepare_request_body(config_data, extra_processes=None):
     """
@@ -387,11 +450,13 @@ def prepare_request_body(config_data, extra_processes=None):
         folders_info = get_folders_info(config_data.get("folders", []))
         logger.debug(f"Folders info collected: {folders_info}")
 
-        # Append the OS install date (YYYYMMDD) when known, e.g.
-        # "Windows-11-10.0.26200-SP0_20260114". Omitted when undetectable.
+        # Append the OS date stamp (YYYYMMDD) when known, e.g.
+        # "Windows-11-10.0.26200-SP0_20260114". On Windows this is the latest
+        # cumulative-update date (to spot un-patched machines); elsewhere it is
+        # the install date. Omitted when undetectable.
         operating_system = platform.platform()
-        if OS_INSTALL_DATE:
-            operating_system = f"{operating_system}_{OS_INSTALL_DATE}"
+        if OS_DATESTAMP:
+            operating_system = f"{operating_system}_{OS_DATESTAMP}"
         logger.debug(f"Operating system: {operating_system}")
 
         request_body = {
